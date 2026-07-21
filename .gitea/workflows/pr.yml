@@ -1,0 +1,39 @@
+name: pr
+on:
+  pull_request:
+jobs:
+  pr-lint:
+    name: pr-lint
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: read
+    steps:
+      - name: Semantic PR title check
+        shell: bash
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          types="feat|fix|chore|docs|style|refactor|perf|test|ci|deps|revert"
+          if echo "$PR_TITLE" | grep -qE "^(${types})(\([a-z0-9._/-]+\))?!?: .+"; then
+            echo "OK: $PR_TITLE"
+          else
+            echo "::error::PR title must follow Conventional Commits (allowed: ${types//|/, }). Got: '$PR_TITLE'"
+            exit 1
+          fi
+      - name: Auto-label by type
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          TYPE=$(echo "$PR_TITLE" | sed -E 's/^([^:( ]+).*/\1/')
+          LABEL="chore"
+          if [[ "$PR_TITLE" =~ ![:\(] ]] || [[ "$PR_TITLE" == *"BREAKING CHANGE"* ]]; then LABEL="breaking";
+          elif [[ "$TYPE" == "feat" ]]; then LABEL="feat";
+          elif [[ "$TYPE" == "fix" || "$TYPE" == "perf" ]]; then LABEL="fix";
+          elif [[ "$TYPE" == "deps" ]]; then LABEL="deps"; fi
+          gh label create "$LABEL" --repo "$REPO" --color 5319e7 --description "Auto-applied by PR lint" 2>/dev/null || true
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$LABEL" || true

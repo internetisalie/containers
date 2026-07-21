@@ -1,0 +1,13 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+jobs:
+  release:
+    runs-on: glimmer-ci
+    env:
+      REGISTRY_URL: registry.internetisalie.net/glimmer
+    container:
+      image: northamerica-northeast1-docker.pkg.dev/cosmic-region-400615/glimmer/glimmer-ci:v2.1.17
+    steps:
+      - run: glimmer ci run --lane=tag

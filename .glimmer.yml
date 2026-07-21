@@ -1,0 +1,19 @@
+# --- Sources ---
+sources:
+  exclude:
+    - dist
+    - local
+
+# --- Formatting ---
+fmt:
+  tool.name: gofumpt
+
+# --- Linting ---
+vet:
+  tool.name: golangci-lint-glimmer
+
+# --- Testing ---
+test:
+  exclude:
+    - mocks
+    - testhelpers
