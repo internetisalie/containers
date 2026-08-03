@@ -160,6 +160,20 @@ func TestSelectHostHonoursItsTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("a blackholed address must not be selected")
 	}
+	// LOWER bound first, and it is the more important of the two. The upper bound
+	// only means anything if a timeout was actually exercised, and whether
+	// 192.0.2.1 blackholes is a property of the HOST, not of RFC 5737: with no
+	// default route, or behind a firewall that answers ICMP unreachable, the dial
+	// fails in microseconds. Then elapsed sits far under the upper bound and this
+	// test passes WITH THE PARAMETER IGNORED — reporting success it did not earn,
+	// which is the exact shape of the skips that started this work.
+	//
+	// Skip rather than fail: a fast-failing host is not a defect in this code, it
+	// simply cannot run this assertion. A CI job pod with restricted egress is
+	// precisely such a host.
+	if elapsed < short/2 {
+		t.Skipf("%s failed fast (%s); no timeout was exercised, so this proves nothing", blackhole, elapsed)
+	}
 	// Generous bound: the assertion is "the short timeout was used", not "timing is
 	// precise". The default is 1s, so an ignored parameter overshoots this by 2x.
 	if elapsed > 3*short {
