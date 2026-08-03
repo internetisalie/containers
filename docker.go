@@ -232,6 +232,18 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 // A dial is a weak check on purpose. It answers "which of these addresses reaches
 // the container" and nothing else; whether the thing behind it is the right service
 // is the probe's question, asked once, afterwards.
+//
+// KNOWN TRADE, decided rather than overlooked. Selection and validation can
+// disagree: an address that completes a handshake without being the container wins
+// selection on every attempt, fails the probe every time, and starves a candidate
+// that would have passed both. The obvious repair — drop an address once its probe
+// fails — is WRONG here, and that is the interesting part: during startup the probe
+// failing is the NORMAL case, so the first attempt would eliminate the correct
+// candidate for not being ready yet. Probing every candidate serially instead would
+// work, at the cost of calling the caller's probe more than once per attempt, which
+// is the contract this design exists to keep simple. So the trade stands: the
+// failure is loud (a timeout naming every candidate) rather than silent, and on any
+// topology where two addresses reach the same daemon it cannot arise.
 func selectHost(hosts []string, port string, timeout time.Duration) (string, error) {
 	type result struct {
 		addr string
@@ -241,7 +253,7 @@ func selectHost(hosts []string, port string, timeout time.Duration) (string, err
 	for _, host := range hosts {
 		go func(host string) {
 			addr := net.JoinHostPort(host, port)
-			results <- result{addr, tcpDialProbe(addr)}
+			results <- result{addr, dialWithTimeout(addr, timeout)}
 		}(host)
 	}
 
@@ -354,11 +366,23 @@ func hostCandidates(ctx context.Context, pool dockertest.ClosablePool) []string 
 	return append(hosts, localhost)
 }
 
-// tcpDialProbe is the default readiness check: a successful TCP connect.
-func tcpDialProbe(hostPort string) error {
-	conn, err := net.DialTimeout("tcp", hostPort, time.Second)
+// defaultDialTimeout bounds a single TCP connect attempt.
+const defaultDialTimeout = time.Second
+
+// dialWithTimeout is the one place a connect duration is decided, so a caller that
+// passes a timeout gets the one it passed. The previous shape took a timeout and
+// dialled with a hardcoded constant that happened to match — inert, harmless today,
+// and precisely the trap that costs whoever later tunes the constant and observes
+// nothing.
+func dialWithTimeout(hostPort string, timeout time.Duration) error {
+	conn, err := net.DialTimeout("tcp", hostPort, timeout)
 	if err != nil {
 		return err
 	}
 	return conn.Close()
+}
+
+// tcpDialProbe is the default readiness check: a successful TCP connect.
+func tcpDialProbe(hostPort string) error {
+	return dialWithTimeout(hostPort, defaultDialTimeout)
 }

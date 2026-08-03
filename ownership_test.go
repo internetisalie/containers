@@ -142,3 +142,27 @@ func TestHostPortIsTheAddressThatAnswered(t *testing.T) {
 	}
 	t.Logf("resolved to %s", res.HostPort())
 }
+
+// selectHost must dial for the duration it was GIVEN. The parameter was previously
+// accepted and ignored — the dial used a hardcoded constant that happened to match,
+// so nothing misbehaved and nothing could observe the promise was empty. This test
+// is what makes it observable: 192.0.2.1 is RFC 5737 TEST-NET-1, which blackholes,
+// so the call can only return when a timeout fires, and which timeout fired is
+// visible in the wall clock.
+func TestSelectHostHonoursItsTimeout(t *testing.T) {
+	const short = 150 * time.Millisecond
+	const blackhole = "192.0.2.1" // RFC 5737: reserved, routed nowhere
+
+	start := time.Now()
+	_, err := selectHost([]string{blackhole}, "4222", short)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("a blackholed address must not be selected")
+	}
+	// Generous bound: the assertion is "the short timeout was used", not "timing is
+	// precise". The default is 1s, so an ignored parameter overshoots this by 2x.
+	if elapsed > 3*short {
+		t.Fatalf("selectHost took %s for a %s timeout — the parameter is not honoured", elapsed, short)
+	}
+}
