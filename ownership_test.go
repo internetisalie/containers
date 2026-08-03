@@ -15,8 +15,12 @@ import (
 // containers from the daemon's view and nothing else, so a label that never lands
 // there makes it a silent no-op — reaping nothing, indistinguishable from a clean
 // fleet. This is the assertion that distinguishes those.
+// Deliberately NOT PodUIDLabel, though it was when this test was written. That key
+// is now stamped by the package itself and the environment's value wins, so a suite
+// run inside a CI job pod — the one environment this all exists for — would see the
+// caller's value replaced and go red for the right behaviour.
 func TestLabelsReachTheDaemon(t *testing.T) {
-	const uidKey = "code.internetisalie.net/containers.pod-uid"
+	const uidKey = "code.internetisalie.net/containers.test-probe"
 	const uidVal = "11111111-2222-3333-4444-555555555555"
 
 	res, err := StartContainer(ContainerConfig{
@@ -44,6 +48,96 @@ func TestLabelsReachTheDaemon(t *testing.T) {
 	}
 	if got := insp.Container.Config.Labels[uidKey]; got != uidVal {
 		t.Fatalf("label %s on the daemon = %q, want %q", uidKey, got, uidVal)
+	}
+}
+
+// The ownership label must land on the daemon for a caller that never asked for it
+// and does not know it exists. That is the whole design: every consumer needs the
+// label, none has a reason to think about it, and a label the caller must remember
+// is the one that will be missing in whichever repository later leaks a container.
+//
+// Daemon-level rather than a unit test on ownershipLabels, because the failure this
+// guards against is the wiring — the helper returning a correct map that nothing
+// passes to Run. Reverting runContainer to WithLabels(cfg.Labels) turns this red and
+// leaves every unit assertion below green.
+func TestPodUIDLabelIsStampedWithoutTheCallerAskingForIt(t *testing.T) {
+	const uid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	t.Setenv(podUIDEnv, uid)
+
+	res, err := StartContainer(ContainerConfig{
+		Name:       "containers-ownership-probe",
+		Repository: "nats",
+		Tag:        "2.10-alpine",
+		Port:       "4222",
+		Ephemeral:  true,
+		// No Labels at all. That is the point.
+		Timeout: 30 * time.Second,
+		Ready:   natsGreeting,
+	})
+	if err != nil {
+		t.Skipf("docker unavailable: %v", err)
+	}
+	defer func() { _ = res.Purge() }()
+
+	pool, err := dockertest.NewPool(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	insp, err := pool.Client().ContainerInspect(context.Background(), res.Name(), mobyclient.ContainerInspectOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := insp.Container.Config.Labels[PodUIDLabel]; got != uid {
+		t.Fatalf("label %s on the daemon = %q, want %q — this container is unreapable",
+			PodUIDLabel, got, uid)
+	}
+}
+
+// Off-cluster there is no pod, so there is nothing to own the container and nothing
+// that would ever reap it. Stamping an empty value would be worse than stamping
+// nothing: a reaper listing by label presence would match every workstation
+// container it could see.
+func TestNoPodUIDLabelOutsideAPod(t *testing.T) {
+	t.Setenv(podUIDEnv, "")
+
+	got := ownershipLabels(map[string]string{"keep": "me"})
+	if _, ok := got[PodUIDLabel]; ok {
+		t.Fatalf("stamped %s with no pod UID in the environment: %v", PodUIDLabel, got)
+	}
+	if got["keep"] != "me" {
+		t.Fatalf("caller labels did not survive: %v", got)
+	}
+}
+
+// The environment wins, which inverts the usual politeness on purpose. The value is
+// an assertion about which pod is running this process: the environment's copy comes
+// from the downward API and cannot be forged, the caller's is a guess. A caller who
+// overrode it could only ever make its own container unreapable.
+func TestCallerCannotOverrideThePodUID(t *testing.T) {
+	const real = "real-pod-uid"
+	t.Setenv(podUIDEnv, real)
+
+	got := ownershipLabels(map[string]string{PodUIDLabel: "a-uid-the-caller-made-up"})
+	if got[PodUIDLabel] != real {
+		t.Fatalf("%s = %q, want the environment's %q — a caller can make its container "+
+			"unreapable", PodUIDLabel, got[PodUIDLabel], real)
+	}
+}
+
+// The caller's map belongs to the caller and may be shared across several
+// StartContainer calls. Writing into it would leak one container's identity onto the
+// next — which, for an ownership label, means reaping a live container.
+func TestOwnershipLabelsDoNotMutateTheCallersMap(t *testing.T) {
+	t.Setenv(podUIDEnv, "some-pod-uid")
+
+	callers := map[string]string{"team": "sim"}
+	_ = ownershipLabels(callers)
+
+	if _, ok := callers[PodUIDLabel]; ok {
+		t.Fatalf("the caller's map was written to: %v", callers)
+	}
+	if len(callers) != 1 {
+		t.Fatalf("the caller's map changed size: %v", callers)
 	}
 }
 

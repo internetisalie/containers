@@ -55,10 +55,15 @@ type ContainerConfig struct {
 	// else. A process token cannot serve — it is meaningless in another namespace
 	// — and once Ephemeral randomises the name, labels are the only handle left.
 	//
-	// Prefer fleet-neutral keys owned by this package's import path, e.g.
-	// "code.internetisalie.net/containers.pod-uid", over consumer-namespaced ones:
-	// a reaper written against one spelling silently reaps nothing when a consumer
-	// picks another, and silence is indistinguishable from a clean fleet.
+	// Prefer fleet-neutral keys owned by this package's import path over
+	// consumer-namespaced ones: a reaper written against one spelling silently
+	// reaps nothing when a consumer picks another, and silence is
+	// indistinguishable from a clean fleet.
+	//
+	// These are ADDITIONAL to the ownership label this package stamps on its own
+	// (PodUIDLabel, from the pod's downward-API UID). Nothing here is required for
+	// a container to be reapable — see ownership.go for why that is not the
+	// caller's job.
 	Labels map[string]string
 
 	// Ephemeral makes this container safe to run beside another of the same kind:
@@ -213,7 +218,7 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 		dockertest.WithName(cfg.Name),
 		dockertest.WithCmd(cfg.Cmd),
 		dockertest.WithEnv(cfg.Env),
-		dockertest.WithLabels(cfg.Labels),
+		dockertest.WithLabels(ownershipLabels(cfg.Labels)),
 		dockertest.WithPortBindings(bindings),
 		dockertest.WithoutReuse(),
 	)
