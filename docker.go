@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	mobyclient "github.com/moby/moby/client"
 	"github.com/ory/dockertest/v4"
@@ -79,6 +80,22 @@ type ContainerConfig struct {
 	// discipline bound one test binary, and any second process on the same daemon
 	// is outside both.
 	Ephemeral bool
+
+	// Limits bound what this container may consume. Zero is unbounded, which is
+	// Docker's default. See Limits.
+	Limits Limits
+
+	// AutoRemove asks the DAEMON to delete the container once it exits, so a
+	// container that crashes or is stopped leaves nothing behind for the next run
+	// to trip over.
+	//
+	// READ WHAT THIS DOES NOT DO, because the name invites the wrong conclusion. It
+	// fires when the CONTAINER exits. It does not fire when the caller's process
+	// dies: a SIGKILLed test leaves its container RUNNING, and a running container
+	// is exactly what AutoRemove never touches. Purge on the happy path and a
+	// reaper for the killed one are still both required; this closes only the gap
+	// between them, where the container has stopped and nobody removed the corpse.
+	AutoRemove bool
 }
 
 // Resource represents a running container managed by this harness.
@@ -131,6 +148,9 @@ func (r *Resource) HostPort() string {
 // nothing to prune and nothing to collide with — the prune is skipped rather than
 // issued as a round-trip that can only miss.
 func StartContainer(cfg ContainerConfig) (*Resource, error) {
+	if err := cfg.Limits.validate(); err != nil {
+		return nil, fmt.Errorf("container %s: %w", cfg.Name, err)
+	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = DefaultTimeout
 	}
@@ -220,6 +240,10 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 		dockertest.WithEnv(cfg.Env),
 		dockertest.WithLabels(ownershipLabels(cfg.Labels)),
 		dockertest.WithPortBindings(bindings),
+		dockertest.WithHostConfig(func(hc *container.HostConfig) {
+			cfg.Limits.apply(hc)
+			hc.AutoRemove = cfg.AutoRemove
+		}),
 		dockertest.WithoutReuse(),
 	)
 	if err != nil {
