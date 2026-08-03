@@ -105,12 +105,16 @@ func natsGreeting(hostPort string) error {
 }
 
 // HostPort must be the address the probe ACTUALLY answered at, not a default that
-// happens to work here. This is the assertion that covers the reachability fix at
-// all: on a workstation loopback works, so every other test in this file passes
-// just as well against a hardcoded 127.0.0.1. Comparing the returned address to
-// the one resolution recorded is what makes the difference observable without a
-// second topology — the race prefers the bridge gateway, so a hardcoded loopback
-// disagrees with it here even though both are reachable.
+// happens to work here. This is the only assertion in the file that covers the
+// reachability change at all: on a workstation loopback works, so every other test
+// passes just as well against a hardcoded 127.0.0.1.
+//
+// The load-bearing check is `hostPort == ""` — revert the measurement and that goes
+// red whichever candidate wins. The equality check below is tautological in healthy
+// code and earns its place only against a mutation that stops HostPort reading what
+// was measured. Do NOT "improve" it into an assertion about WHICH address is
+// chosen: selection races the candidates, both answer here, and a test asserting a
+// winner would be genuinely flaky.
 func TestHostPortIsTheAddressThatAnswered(t *testing.T) {
 	res, err := StartContainer(ContainerConfig{
 		Name:       "containers-hostport-probe",

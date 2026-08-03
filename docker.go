@@ -26,6 +26,13 @@ const DefaultTimeout = 60 * time.Second
 
 // ReadyCheck is retried until it succeeds or the timeout elapses. It receives the
 // host address (host:port) the container's mapped Port is reachable at.
+//
+// It is called ONCE per readiness attempt, serially, against the single address
+// selected for that attempt. It is never called concurrently and never against an
+// address that is then discarded, so a probe may hold state, write to a *testing.T,
+// or open a pooled connection. Candidate addresses are narrowed by a built-in TCP
+// dial before this runs, precisely so that the concurrency stays on this side of
+// the callback boundary.
 type ReadyCheck func(hostPort string) error
 
 // ContainerConfig defines the properties required to manage a singleton test container.
@@ -109,9 +116,15 @@ func (r *Resource) HostPort() string {
 	return net.JoinHostPort(localhost, r.resource.GetPort(r.port+"/tcp"))
 }
 
-// StartContainer prunes any pre-existing container with the given name, starts a
-// fresh one bound to cfg.Port, and blocks until the readiness probe passes (or
-// Timeout elapses). The caller must Purge the Resource to stop the container.
+// StartContainer starts a container bound to cfg.Port and blocks until the
+// readiness probe passes (or Timeout elapses). The caller must Purge the Resource
+// to stop it.
+//
+// A NON-Ephemeral container is a singleton keyed on its name: any pre-existing
+// holder of that name is force-removed first, so two concurrent callers destroy
+// each other's container. An Ephemeral one has a randomised name, so there is
+// nothing to prune and nothing to collide with — the prune is skipped rather than
+// issued as a round-trip that can only miss.
 func StartContainer(cfg ContainerConfig) (*Resource, error) {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = DefaultTimeout
@@ -125,9 +138,11 @@ func StartContainer(cfg ContainerConfig) (*Resource, error) {
 	if err != nil {
 		return nil, err
 	}
-	if errRemove := removeExisting(ctx, pool, cfg.Name); errRemove != nil {
-		_ = pool.Close(ctx)
-		return nil, errRemove
+	if !cfg.Ephemeral {
+		if errRemove := removeExisting(ctx, pool, cfg.Name); errRemove != nil {
+			_ = pool.Close(ctx)
+			return nil, errRemove
+		}
 	}
 
 	res, err := runContainer(ctx, pool, cfg)
@@ -208,47 +223,77 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 	return res, nil
 }
 
-// waitForReady blocks until the container answers the caller's probe at one of the
-// candidate addresses, and records which one answered. The probe does double duty:
-// it establishes reachability AND identity, because it is the caller's own — a
-// bare TCP connect would accept any stranger listening on that address, which is a
-// claim about a port wearing the clothes of a claim about a service.
+// selectHost narrows the candidates to one, using a built-in TCP dial rather than
+// the caller's probe. Racing lives here, on this side of the callback boundary:
+// the caller's ReadyCheck may be stateful, and calling it once per candidate in
+// parallel — then discarding all but one result — would be a silent contract change
+// that breaks in the consumer's repository rather than in this one.
 //
-// Candidates race rather than queue. Sequentially, an address that is
-// unroutable-but-not-refused burns the whole dial timeout before the next is
-// tried, and rootless Docker, Docker Desktop and a remote DOCKER_HOST all put the
-// bridge gateway somewhere that blackholes. Racing makes the cost the fastest
-// candidate instead of the sum of the failures ahead of it.
+// A dial is a weak check on purpose. It answers "which of these addresses reaches
+// the container" and nothing else; whether the thing behind it is the right service
+// is the probe's question, asked once, afterwards.
+func selectHost(hosts []string, port string, timeout time.Duration) (string, error) {
+	type result struct {
+		addr string
+		err  error
+	}
+	results := make(chan result, len(hosts))
+	for _, host := range hosts {
+		go func(host string) {
+			addr := net.JoinHostPort(host, port)
+			results <- result{addr, tcpDialProbe(addr)}
+		}(host)
+	}
+
+	var lastErr error
+	for range hosts {
+		got := <-results
+		if got.err == nil {
+			return got.addr, nil
+		}
+		lastErr = got.err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no candidate addresses to try")
+	}
+	return "", lastErr
+}
+
+// waitForReady blocks until the container answers the caller's probe, and records
+// the address it answered at.
+//
+// Each attempt: narrow the candidates with a cheap dial, then run the caller's
+// probe ONCE against the winner. Racing the dials matters because an address that
+// is unroutable-but-not-refused burns the whole timeout before the next is tried,
+// and rootless Docker, Docker Desktop and a remote DOCKER_HOST all put the bridge
+// gateway somewhere that blackholes.
 func waitForReady(ctx context.Context, pool dockertest.ClosablePool, cfg ContainerConfig, r *Resource) error {
+	const selectTimeout = time.Second
+
 	probe := cfg.Ready
 	if probe == nil {
 		probe = tcpDialProbe
 	}
-	port := r.resource.GetPort(r.port + "/tcp")
 	hosts := hostCandidates(ctx, pool)
 
 	err := pool.Retry(ctx, cfg.Timeout, func() error {
-		type result struct {
-			hostPort string
-			err      error
+		// Inside the retry, not above it. With Ephemeral the daemon assigns the host
+		// port, so this depends on inspect data being populated; resolved once
+		// outside, an empty value would make every subsequent attempt dial "host:"
+		// and burn the whole timeout on a container that was healthy.
+		port := r.resource.GetPort(r.port + "/tcp")
+		if port == "" {
+			return fmt.Errorf("container %s publishes no host port for %s yet", cfg.Name, r.port)
 		}
-		results := make(chan result, len(hosts))
-		for _, host := range hosts {
-			go func(host string) {
-				addr := net.JoinHostPort(host, port)
-				results <- result{addr, probe(addr)}
-			}(host)
+		addr, err := selectHost(hosts, port, selectTimeout)
+		if err != nil {
+			return err
 		}
-		var lastErr error
-		for range hosts {
-			got := <-results
-			if got.err == nil {
-				r.hostPort = got.hostPort
-				return nil
-			}
-			lastErr = got.err
+		if err := probe(addr); err != nil {
+			return err
 		}
-		return lastErr
+		r.hostPort = addr
+		return nil
 	})
 	if err != nil {
 		return fmt.Errorf("container %s unreachable at any of %v: %w", cfg.Name, hosts, err)
@@ -273,14 +318,15 @@ func uniqueName(base string) string {
 	return fmt.Sprintf("%s-%s", base, hex.EncodeToString(buf))
 }
 
-// hostCandidates returns the addresses worth trying for a published port, best
-// first. The daemon is ASKED for its own bridge gateway rather than the
-// environment being interrogated: a job pod on a separate CNI can route to that
-// gateway even though loopback is refused.
+// hostCandidates returns the addresses worth trying for a published port. The
+// order carries no preference — selection races them, so any address that answers
+// is acceptable and on a workstation both do. Do not read this list as a ranking.
 //
-// Loopback stays in the list and stays last. It is not an error fallback — it is
-// the right answer wherever the daemon and the caller share a namespace, and the
-// only candidate available if the daemon reports no bridge gateway at all.
+// The daemon is ASKED for its own bridge gateway rather than the environment being
+// interrogated: a job pod on a separate CNI can route to that gateway even though
+// loopback is refused. Loopback is always included: it is the right answer wherever
+// the daemon and the caller share a namespace, and the only candidate available if
+// the daemon reports no bridge gateway at all.
 func hostCandidates(ctx context.Context, pool dockertest.ClosablePool) []string {
 	const bridgeNetwork = "bridge"
 
@@ -293,7 +339,12 @@ func hostCandidates(ctx context.Context, pool dockertest.ClosablePool) []string 
 				// IsLoopback rather than a comparison against the literal: the
 				// gateway is a netip.Addr, and asking what it IS beats asking
 				// whether it matches one spelling of what it might be.
-				if ipam.Gateway.IsValid() && !ipam.Gateway.IsLoopback() {
+				//
+				// Is4 because the port is published on 0.0.0.0. A dual-stack bridge
+				// also reports a v6 gateway, and taking the first non-loopback entry
+				// could pick an address nothing is listening on -- dead weight that
+				// the race would hide rather than surface.
+				if ipam.Gateway.IsValid() && !ipam.Gateway.IsLoopback() && ipam.Gateway.Is4() {
 					hosts = append(hosts, ipam.Gateway.String())
 					break
 				}
