@@ -96,6 +96,13 @@ type ContainerConfig struct {
 	// reaper for the killed one are still both required; this closes only the gap
 	// between them, where the container has stopped and nobody removed the corpse.
 	AutoRemove bool
+
+	// Mounts attaches host filesystem paths into the container.
+	//
+	// Each mount binds an absolute host Source to an absolute container Target.
+	// ReadOnly should be set to true whenever the container does not need write
+	// access, bounding the blast radius against host mutation. See Mount.
+	Mounts []Mount
 }
 
 // Resource represents a running container managed by this harness.
@@ -149,6 +156,9 @@ func (r *Resource) HostPort() string {
 // issued as a round-trip that can only miss.
 func StartContainer(cfg ContainerConfig) (*Resource, error) {
 	if err := cfg.Limits.validate(); err != nil {
+		return nil, fmt.Errorf("container %s: %w", cfg.Name, err)
+	}
+	if err := validateMounts(cfg.Mounts); err != nil {
 		return nil, fmt.Errorf("container %s: %w", cfg.Name, err)
 	}
 	if cfg.Timeout == 0 {
@@ -242,6 +252,7 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 		dockertest.WithPortBindings(bindings),
 		dockertest.WithHostConfig(func(hc *container.HostConfig) {
 			cfg.Limits.apply(hc)
+			applyMounts(hc, cfg.Mounts)
 			hc.AutoRemove = cfg.AutoRemove
 		}),
 		dockertest.WithoutReuse(),
