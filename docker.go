@@ -10,7 +10,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"time"
@@ -22,7 +24,8 @@ import (
 	"github.com/ory/dockertest/v4"
 )
 
-// DefaultTimeout is used when ContainerConfig.Timeout is zero.
+// DefaultTimeout is used for readiness when ContainerConfig.Timeout is zero,
+// and bounds independent failure cleanup.
 const DefaultTimeout = 60 * time.Second
 
 // ReadyCheck is retried until it succeeds or the timeout elapses. It receives the
@@ -36,12 +39,18 @@ const DefaultTimeout = 60 * time.Second
 // the callback boundary.
 type ReadyCheck func(hostPort string) error
 
+// ResourceReadyCheck probes an outbound worker without a listening port. It is
+// called serially until it succeeds, the container exits, or startup is cancelled.
+// The callback must honor ctx; it may inspect/exec the resource or observe an
+// external service to which the worker connects. It must not retain or purge r.
+type ResourceReadyCheck func(ctx context.Context, r *Resource) error
+
 // ContainerConfig defines the properties required to manage a singleton test container.
 type ContainerConfig struct {
 	Name       string        // container name (also used to prune a stale prior instance)
 	Repository string        // image repository, e.g. "cockroachdb/cockroach"
 	Tag        string        // image tag, e.g. "v24.3.9"
-	Port       string        // container port to expose + bind, e.g. "26257"
+	Port       string        // TCP port to publish, e.g. "26257"; empty requires ReadyResource
 	Cmd        []string      // optional command override
 	Env        []string      // optional environment variables
 	Timeout    time.Duration // readiness timeout (DefaultTimeout if zero)
@@ -49,6 +58,21 @@ type ContainerConfig struct {
 	// dial of the mapped host:port is used (sufficient for servers that accept a
 	// connection immediately; supply a real probe for databases).
 	Ready ReadyCheck
+
+	// ReadyResource is required when Port is empty. No ports are published in
+	// this mode, including ports exposed by the image. Mutually exclusive with
+	// Ready and Port; TCP-service behavior is unchanged when Port is set.
+	ReadyResource ResourceReadyCheck
+
+	// User and Entrypoint override the image defaults. A nil Entrypoint retains
+	// the image default; a non-nil empty slice clears it.
+	User       string
+	Entrypoint []string
+	// NetworkMode selects Docker networking, e.g. "container:<ID>" to share a
+	// peer's network namespace. Empty retains Docker's default. Published ports
+	// cannot be combined with container, host or none networking. Purge workers
+	// before the peer; its loss is not supervised by this harness.
+	NetworkMode string
 
 	// Labels are stamped on the container. They are how anything OUTSIDE this
 	// process identifies what it started: the container is a host Docker object,
@@ -65,6 +89,8 @@ type ContainerConfig struct {
 	// (PodUIDLabel, from the pod's downward-API UID). Nothing here is required for
 	// a container to be reapable — see ownership.go for why that is not the
 	// caller's job.
+	// The reserved code.internetisalie.net/containers.startup-id key is always
+	// replaced with a private per-start token, without changing the caller's map.
 	Labels map[string]string
 
 	// Ephemeral makes this container safe to run beside another of the same kind:
@@ -105,7 +131,8 @@ type ContainerConfig struct {
 	Mounts []Mount
 }
 
-// Resource represents a running container managed by this harness.
+// Resource represents a container managed by this harness, including after stop
+// or kill. Operations may run concurrently, but Purge must not race other calls.
 type Resource struct {
 	pool     dockertest.ClosablePool
 	resource dockertest.ClosableResource
@@ -126,7 +153,7 @@ func (r *Resource) Name() string {
 
 // HostPort returns the host address (host:port) this container was PROVEN
 // reachable at — the readiness probe succeeded against it before StartContainer
-// returned.
+// returned. It returns an empty string for outbound workers.
 //
 // It used to return 127.0.0.1 unconditionally, which is right only where the
 // daemon shares the caller's network namespace. It does on a workstation and in a
@@ -136,7 +163,7 @@ func (r *Resource) Name() string {
 // Kubernetes?" is TRUE on both of one fleet's CI pools and only one of them needs
 // a non-loopback address — so the address is measured rather than computed.
 func (r *Resource) HostPort() string {
-	if r == nil || r.resource == nil {
+	if r == nil || r.resource == nil || r.port == "" {
 		return ""
 	}
 	if r.hostPort != "" {
@@ -145,9 +172,9 @@ func (r *Resource) HostPort() string {
 	return net.JoinHostPort(localhost, r.resource.GetPort(r.port+"/tcp"))
 }
 
-// StartContainer starts a container bound to cfg.Port and blocks until the
-// readiness probe passes (or Timeout elapses). The caller must Purge the Resource
-// to stop it.
+// StartContainer starts a TCP service or outbound worker and waits for readiness.
+// It is StartContainerContext with a background context. The caller must Purge
+// the Resource, even after stopping or killing it.
 //
 // A NON-Ephemeral container is a singleton keyed on its name: any pre-existing
 // holder of that name is force-removed first, so two concurrent callers destroy
@@ -155,6 +182,19 @@ func (r *Resource) HostPort() string {
 // nothing to prune and nothing to collide with — the prune is skipped rather than
 // issued as a round-trip that can only miss.
 func StartContainer(cfg ContainerConfig) (*Resource, error) {
+	return StartContainerContext(context.Background(), cfg)
+}
+
+// StartContainerContext uses ctx for Docker operations and cfg.Timeout for the
+// readiness phase only, preserving StartContainer's TCP timeout semantics. Use a
+// caller deadline to bound the whole startup; readiness callbacks must themselves
+// be bounded (ReadyResource must honor its context). Failure cleanup uses a fresh
+// bounded context, including on panic; an original panic is not swallowed. The
+// returned resource's lifetime is not tied to ctx once startup succeeds.
+func StartContainerContext(ctx context.Context, cfg ContainerConfig) (result *Resource, err error) {
+	if err := validateReadiness(cfg); err != nil {
+		return nil, fmt.Errorf("container %s: %w", cfg.Name, err)
+	}
 	if err := cfg.Limits.validate(); err != nil {
 		return nil, fmt.Errorf("container %s: %w", cfg.Name, err)
 	}
@@ -168,42 +208,96 @@ func StartContainer(cfg ContainerConfig) (*Resource, error) {
 		cfg.Name = uniqueName(cfg.Name)
 	}
 
-	ctx := context.Background()
-	pool, err := initPool(ctx, cfg.Timeout)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	pool, err := initPool(ctx, cfg.Timeout)
+	if err != nil {
+		return nil, errors.Join(err, ctx.Err())
+	}
+	var r *Resource
+	// Also runs during panic/Goexit. No recover is needed: the original panic
+	// propagates after cleanup. Once registered, use exactly the Purge path so
+	// failed readiness gets the same AutoRemove handling as explicit cleanup.
+	defer func() {
+		if result != nil {
+			return
+		}
+		var cleanupErr error
+		if r != nil {
+			cleanupErr = r.Purge()
+		} else {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+			defer cancel()
+			cleanupErr = pool.Close(cleanupCtx)
+		}
+		if cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed startup cleanup: %w", cleanupErr))
+		}
+	}()
 	if !cfg.Ephemeral {
 		if errRemove := removeExisting(ctx, pool, cfg.Name); errRemove != nil {
-			_ = pool.Close(ctx)
-			return nil, errRemove
+			return nil, errors.Join(errRemove, ctx.Err())
 		}
 	}
 
+	// The dependency may fail between Docker creation and tracking the resource.
+	// A private per-start label lets failure cleanup identify ONLY this attempt,
+	// even if another caller has already replaced the reusable singleton name.
+	cfg.Labels = maps.Clone(cfg.Labels)
+	if cfg.Labels == nil {
+		cfg.Labels = make(map[string]string)
+	}
+	cfg.Labels[startupLabel] = uniqueName("start")
 	res, err := runContainer(ctx, pool, cfg)
 	if err != nil {
-		_ = pool.Close(ctx)
-		return nil, err
+		return nil, errors.Join(err, ctx.Err(), cleanupUntracked(pool, cfg, ctx.Err() != nil))
 	}
 
-	r := &Resource{pool: pool, resource: res, port: cfg.Port, name: cfg.Name}
-	if err := waitForReady(ctx, pool, cfg, r); err != nil {
-		_ = r.Purge()
-		return nil, err
+	r = &Resource{pool: pool, resource: res, port: cfg.Port, name: cfg.Name}
+	readyCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
+	if cfg.Port == "" {
+		err = waitForResource(readyCtx, cfg, r)
+	} else {
+		err = waitForReady(readyCtx, pool, cfg, r)
+	}
+	if err == nil {
+		err = readyCtx.Err()
+	}
+	if err != nil {
+		return nil, errors.Join(err, readyCtx.Err())
 	}
 	return r, nil
 }
 
-// Purge removes the running container from the Docker daemon. Safe on nil.
+// Purge stops/removes the container and closes its owned client. Safe on nil and
+// repeated calls. Do not call concurrently with other resource operations.
 func (r *Resource) Purge() error {
-	if r == nil || r.pool == nil || r.resource == nil {
+	if r == nil || r.pool == nil || r.resource == nil || r.pool.Client() == nil {
 		return nil
 	}
-	ctx := context.Background()
-	if err := r.resource.Close(ctx); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+	defer cancel()
+	// Close the pool even if resource removal fails, so its owned client is not
+	// leaked and tracked-resource cleanup gets another chance.
+	err := r.resource.Close(ctx)
+	// AutoRemove can race explicit removal: Docker returns conflict while the
+	// daemon's removal is in progress. Confirm actual disappearance before
+	// accepting that conflict; do not turn arbitrary removal errors into success.
+	if errdefs.IsConflict(err) {
+		if info := r.resource.Container(); info.HostConfig != nil && info.HostConfig.AutoRemove {
+			if waitErr := waitRemoved(ctx, r.pool, r.ID()); waitErr == nil {
+				err = r.resource.Close(ctx) // untrack the now-absent resource
+			} else {
+				err = errors.Join(err, waitErr)
+			}
+		}
+	}
+	if err := errors.Join(err, r.pool.Close(ctx)); err != nil {
 		return fmt.Errorf("failed to purge container: %w", err)
 	}
-	return r.pool.Close(ctx)
+	return nil
 }
 
 func initPool(ctx context.Context, timeout time.Duration) (dockertest.ClosablePool, error) {
@@ -224,10 +318,6 @@ func removeExisting(ctx context.Context, pool dockertest.ClosablePool, name stri
 }
 
 func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg ContainerConfig) (dockertest.ClosableResource, error) {
-	port, err := network.ParsePort(cfg.Port + "/tcp")
-	if err != nil {
-		return nil, fmt.Errorf("invalid port %q: %w", cfg.Port, err)
-	}
 	// An Ephemeral container asks the daemon to choose the host port. A fixed one
 	// is a second shared resource beside the name: two concurrent callers collide
 	// on it, and the loser either fails to start or is quietly given a different
@@ -236,11 +326,16 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 	if cfg.Ephemeral {
 		hostPort = ""
 	}
-	bindings := network.PortMap{
-		port: []network.PortBinding{{
+	bindings := network.PortMap{}
+	if cfg.Port != "" {
+		port, err := network.ParsePort(cfg.Port + "/tcp")
+		if err != nil {
+			return nil, fmt.Errorf("invalid port %q: %w", cfg.Port, err)
+		}
+		bindings[port] = []network.PortBinding{{
 			HostIP:   netip.MustParseAddr("0.0.0.0"),
 			HostPort: hostPort,
-		}},
+		}}
 	}
 
 	res, err := pool.Run(ctx, cfg.Repository,
@@ -248,12 +343,24 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 		dockertest.WithName(cfg.Name),
 		dockertest.WithCmd(cfg.Cmd),
 		dockertest.WithEnv(cfg.Env),
+		dockertest.WithUser(cfg.User),
+		dockertest.WithContainerConfig(func(cc *container.Config) {
+			if cfg.Entrypoint != nil {
+				cc.Entrypoint = cfg.Entrypoint
+			}
+		}),
 		dockertest.WithLabels(ownershipLabels(cfg.Labels)),
 		dockertest.WithPortBindings(bindings),
 		dockertest.WithHostConfig(func(hc *container.HostConfig) {
 			cfg.Limits.apply(hc)
 			applyMounts(hc, cfg.Mounts)
 			hc.AutoRemove = cfg.AutoRemove
+			if cfg.NetworkMode != "" {
+				hc.NetworkMode = container.NetworkMode(cfg.NetworkMode)
+			}
+			if cfg.Port == "" {
+				hc.PublishAllPorts = false
+			}
 		}),
 		dockertest.WithoutReuse(),
 	)
