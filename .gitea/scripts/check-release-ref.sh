@@ -14,7 +14,9 @@ if ! git show-ref --verify --quiet "$main_ref"; then
   echo "release requires the fetched main ref: $main_ref" >&2
   exit 1
 fi
-if ! git merge-base --is-ancestor HEAD "$main_ref"; then
+# Branch tags may exercise the real publisher only as prereleases. Stable
+# versions must still be reachable from canonical main.
+if [[ "$tag" != *-* ]] && ! git merge-base --is-ancestor HEAD "$main_ref"; then
   echo 'release tag must point to a commit on main' >&2
   exit 1
 fi

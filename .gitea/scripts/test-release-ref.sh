@@ -36,4 +36,8 @@ expect_failure 'release requires a vMAJOR.MINOR.PATCH version tag'
 git tag -d experiment >/dev/null
 git tag v1.2.4
 expect_failure 'release tag must point to a commit on main'
-echo 'release ref guard: main tag accepted; missing ref, untagged, malformed and side-branch tags rejected'
+git tag -d v1.2.4 >/dev/null
+git tag v1.2.4-rc.1
+make --no-print-directory release GORELEASER=true
+expect_failure 'release requires the fetched main ref' refs/remotes/missing/main
+echo 'release ref guard: main stable and branch prerelease accepted; missing ref, untagged, malformed and off-main stable tags rejected'

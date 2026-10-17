@@ -159,8 +159,10 @@ make release-snapshot    # source archive + checksums, never published
 ```
 
 GoReleaser v2.15.4 is pinned in the workflow; use that version locally. Version
-tags use `vMAJOR.MINOR.PATCH` (optionally with a prerelease suffix) and must point
-to a commit on `main`. Fetch full history and tags before releasing. A `v*` tag
+tags use `vMAJOR.MINOR.PATCH` (optionally with a prerelease suffix). Stable tags
+must point to a commit on `main`; branch tags such as `v0.6.0-rc.1` may test the
+publisher and are marked as prereleases, not stable releases. Fetch full history
+and tags before releasing. A `v*` tag
 push runs the checks and then `make release`, using the per-job Gitea token to
 create release notes, a source archive and checksums. Branch pushes validate only;
 they cannot publish a release. No binary, Docker image or deployment is produced.
