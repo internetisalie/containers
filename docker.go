@@ -345,6 +345,15 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 		dockertest.WithEnv(cfg.Env),
 		dockertest.WithUser(cfg.User),
 		dockertest.WithContainerConfig(func(cc *container.Config) {
+			// Some daemon versions ignore bindings for ports absent from the
+			// image's EXPOSE metadata. Declare the requested service port too;
+			// an image's default port need not match the overridden command.
+			if cfg.Port != "" {
+				cc.ExposedPorts = network.PortSet{}
+				for port := range bindings {
+					cc.ExposedPorts[port] = struct{}{}
+				}
+			}
 			if cfg.Entrypoint != nil {
 				cc.Entrypoint = cfg.Entrypoint
 			}
