@@ -1,0 +1,27 @@
+version: 2
+project_name: containers
+
+# Importable Go module: release source and notes, never binaries or images.
+builds:
+  - skip: true
+
+source:
+  enabled: true
+  name_template: "{{ .ProjectName }}-{{ .Version }}-source"
+  prefix_template: "{{ .ProjectName }}-{{ .Version }}/"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+
+gitea_urls:
+  api: https://gitea.internetisalie.net/api/v1
+  download: https://gitea.internetisalie.net
+
+release:
+  gitea:
+    owner: internetisalie
+    name: containers
+  prerelease: auto
