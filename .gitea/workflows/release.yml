@@ -1,0 +1,72 @@
+name: release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  GOWORK: "off"
+  GOTOOLCHAIN: local
+
+jobs:
+  check:
+    # This repo is user-owned, not in the loom org. Use the instance act pool,
+    # not the org-only loom-ci label, with the same explicit Loom job image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    container:
+      image: registry.internetisalie.net/loom/runner-images:ubuntu-24.04-v26.08.01
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          version: v2.15.4
+          install-only: true
+      - name: validate release configuration and build an unpublished source snapshot
+        run: make release-check release-snapshot
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    container:
+      image: registry.internetisalie.net/loom/runner-images:ubuntu-24.04-v26.08.01
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          version: v2.15.4
+          install-only: true
+      - name: create the Gitea release, source archive and checksums
+        env:
+          # Same per-job repository token used by Loom's release lanes. No
+          # standing release secret or GitHub write credential is needed here.
+          GITEA_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ""
+        run: make release

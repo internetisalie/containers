@@ -1,6 +1,8 @@
 GOPATH = $(shell go env GOPATH)
 GOBIN = $(GOPATH)/bin
 BUILDER = $(GOBIN)/glimmer
+GORELEASER ?= goreleaser
+RELEASE_MAIN_REF ?= refs/remotes/origin/main
 
 # glimmer tasks
 TASKS = test vet generate fmt vulnerability clean release publish
@@ -30,8 +32,23 @@ vulnerability:
 clean:
 	$(BUILDER) $@ $(ARGS)
 
-release:
-	$(BUILDER) $@ $(ARGS)
+# Release entry points are shared by terminals and .gitea/workflows/release.yml,
+# following Loom's one-definition-per-task convention. Other Glimmer targets stay
+# unchanged; this is not a wholesale build/lint/test migration.
+.PHONY: release-check release-snapshot release-ref-check
+
+release-check:
+	$(GORELEASER) check
+	bash .gitea/scripts/test-release-ref.sh
+
+release-snapshot:
+	$(GORELEASER) release --snapshot --clean --skip=publish
+
+release-ref-check:
+	bash .gitea/scripts/check-release-ref.sh "$(RELEASE_MAIN_REF)"
+
+release: release-ref-check
+	$(GORELEASER) release --clean $(ARGS)
 
 publish:
 	$(BUILDER) $@ $(ARGS)

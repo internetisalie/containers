@@ -146,3 +146,31 @@ Use disk-backed temporary/cache directories if the host's temporary filesystem i
 small; the tests create disposable filesystem fixtures as well as containers.
 
 Implementation scope and verification evidence: [container-features.md](container-features.md).
+
+## Releases
+
+This repository publishes a **Go module, not a container image**. The canonical
+release is on Gitea. `.gitea/workflows/release.yml` calls the same Make targets
+used locally, following the Loom repository layout:
+
+```sh
+make release-check       # GoReleaser configuration and release-ref guard tests
+make release-snapshot    # source archive + checksums, never published
+```
+
+GoReleaser v2.15.4 is pinned in the workflow; use that version locally. Version
+tags use `vMAJOR.MINOR.PATCH` (optionally with a prerelease suffix). Stable tags
+must point to a commit on `main`; branch tags such as `v0.6.0-rc.1` may test the
+publisher and are marked as prereleases, not stable releases. Fetch full history
+and tags before releasing. A `v*` tag
+push runs the checks and then `make release`, using the per-job Gitea token to
+create release notes, a source archive and checksums. Branch pushes validate only;
+they cannot publish a release. No binary, Docker image or deployment is produced.
+
+For manual publishing from a clean, tagged checkout, set `GITEA_TOKEN` without
+printing it, unset any unrelated `GITHUB_TOKEN`, and run `make release`. If the
+canonical remote is named `gitea` rather than checkout's `origin`, pass
+`RELEASE_MAIN_REF=refs/remotes/gitea/main`. Do not move or overwrite published
+version tags. After the canonical release succeeds, push the **same tag** to the
+GitHub remote and verify that it resolves to the same commit. This does not
+enable GitHub release CI or mirror unrelated branches.
