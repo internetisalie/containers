@@ -59,6 +59,8 @@ func TestStartupCancellationBeforeResourceRegistration(t *testing.T) {
 					cancel()
 					w.WriteHeader(http.StatusInternalServerError)
 					fmt.Fprint(w, `{"message":"inspection cancelled"}`)
+				case path == "/containers/json":
+					fmt.Fprint(w, `[]`) // the foreign holder is not our late create
 				case req.Method == http.MethodGet && strings.HasPrefix(path, "/containers/") && strings.HasSuffix(path, "/json"):
 					lookups++
 					if mode == "foreign" {

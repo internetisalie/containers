@@ -14,7 +14,7 @@ import (
 
 // Exercise deterministic Docker responses that cannot be reliably induced by a
 // real daemon. Worker end-to-end tests separately prove actual process behavior.
-func fakeWorker(t *testing.T, autoRemove bool, handle func(http.ResponseWriter, *http.Request, string) bool) *Resource {
+func fakeDaemon(t *testing.T, autoRemove bool, handle func(http.ResponseWriter, *http.Request, string) bool) string {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		path := strings.TrimPrefix(req.URL.Path, "/v1.55")
@@ -30,6 +30,8 @@ func fakeWorker(t *testing.T, autoRemove bool, handle func(http.ResponseWriter, 
 		case path == "/containers/create":
 			w.WriteHeader(http.StatusCreated)
 			fmt.Fprint(w, `{"Id":"fixture-container"}`)
+		case path == "/networks/bridge":
+			w.WriteHeader(http.StatusNotFound)
 		case strings.HasSuffix(path, "/json"):
 			fmt.Fprintf(w, `{"Id":"fixture-container","State":{"Running":true},"HostConfig":{"AutoRemove":%t}}`, autoRemove)
 		case strings.HasSuffix(path, "/start"), strings.HasSuffix(path, "/stop"), req.Method == http.MethodDelete:
@@ -44,6 +46,12 @@ func fakeWorker(t *testing.T, autoRemove bool, handle func(http.ResponseWriter, 
 	t.Setenv("DOCKER_API_VERSION", "1.55")
 	t.Setenv("DOCKER_TLS_VERIFY", "")
 	t.Setenv("DOCKER_CERT_PATH", "")
+	return server.URL
+}
+
+func fakeWorker(t *testing.T, autoRemove bool, handle func(http.ResponseWriter, *http.Request, string) bool) *Resource {
+	t.Helper()
+	fakeDaemon(t, autoRemove, handle)
 	cfg := workerConfig()
 	cfg.AutoRemove = autoRemove
 	cfg.ReadyResource = func(context.Context, *Resource) error { return nil }

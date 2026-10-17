@@ -58,8 +58,10 @@ func (r *Resource) Inspect(ctx context.Context) (container.InspectResponse, erro
 
 // Stop asks Docker to stop the container gracefully, then SIGKILL it if it has
 // not exited within grace. Positive durations round up to whole seconds; zero
-// means immediate forceful termination. The container remains available for
-// inspection/logs unless AutoRemove was configured. Purge is still required.
+// sends the stop signal then immediately permits SIGKILL (a TERM handler may
+// still begin running). Use Kill for SIGKILL without a stop signal. The container
+// remains available for inspection/logs unless AutoRemove was configured. Purge
+// is still required.
 func (r *Resource) Stop(ctx context.Context, grace time.Duration) error {
 	if grace < 0 {
 		return fmt.Errorf("stop grace must not be negative")
@@ -136,6 +138,8 @@ type ExecResult struct {
 // Exec executes argv directly, without a shell or TTY, as the container's user.
 // It buffers output in memory. Cancellation closes the attached transport and
 // returns an error; it does not guarantee termination of the remote command.
+// Docker may report daemon-side exec failures in StdOut with exit 126/127 and
+// nil error, rather than in StdErr. Always check ExitCode as well as the error.
 func (r *Resource) Exec(ctx context.Context, cmd []string) (ExecResult, error) {
 	if err := r.checkUsable(); err != nil {
 		return ExecResult{}, err

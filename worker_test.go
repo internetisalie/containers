@@ -472,6 +472,59 @@ func TestWorkerAutoRemoveStillPurges(t *testing.T) {
 	assertRemoved(t, c, r.ID())
 }
 
+func TestWorkerAutoRemoveFailedReadiness(t *testing.T) {
+	c := observer(t)
+	for _, mode := range []string{"error", "panic"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := workerConfig()
+			cfg.AutoRemove = true
+			var observed *Resource
+			probeErr := errors.New("fixture readiness rejected")
+			t.Cleanup(func() {
+				if observed != nil {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					_, err := c.ContainerRemove(ctx, observed.ID(), mobyclient.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
+					if err != nil && !errdefs.IsNotFound(err) {
+						t.Error(err)
+					}
+				}
+			})
+			cfg.ReadyResource = func(ctx context.Context, r *Resource) error {
+				observed = r
+				if err := r.Kill(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if mode == "panic" {
+					panic(probeErr)
+				}
+				return probeErr
+			}
+			var r *Resource
+			var err error
+			var recovered any
+			func() {
+				defer func() { recovered = recover() }()
+				r, err = StartContainerContext(t.Context(), cfg)
+			}()
+			if mode == "panic" {
+				if recovered != probeErr {
+					t.Fatalf("panic was swallowed/replaced: %v", recovered)
+				}
+			} else if recovered != nil || r != nil || !errors.Is(err, probeErr) || strings.Contains(err.Error(), "failed startup cleanup") {
+				t.Fatalf("failed readiness lost its cause or invented cleanup failure: %v, %v, %v", r, err, recovered)
+			}
+			if observed == nil {
+				t.Fatal("readiness callback not reached")
+			}
+			assertRemoved(t, c, observed.ID())
+			if observed.pool.Client() != nil {
+				t.Fatal("failed readiness leaked the client")
+			}
+		})
+	}
+}
+
 func TestWorkerClearsImageEntrypoint(t *testing.T) {
 	observer(t)
 	cfg := workerConfig()

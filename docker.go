@@ -24,7 +24,8 @@ import (
 	"github.com/ory/dockertest/v4"
 )
 
-// DefaultTimeout is used when ContainerConfig.Timeout is zero.
+// DefaultTimeout is used for readiness when ContainerConfig.Timeout is zero,
+// and bounds independent failure cleanup.
 const DefaultTimeout = 60 * time.Second
 
 // ReadyCheck is retried until it succeeds or the timeout elapses. It receives the
@@ -69,7 +70,8 @@ type ContainerConfig struct {
 	Entrypoint []string
 	// NetworkMode selects Docker networking, e.g. "container:<ID>" to share a
 	// peer's network namespace. Empty retains Docker's default. Published ports
-	// cannot be combined with container, host or none networking.
+	// cannot be combined with container, host or none networking. Purge workers
+	// before the peer; its loss is not supervised by this harness.
 	NetworkMode string
 
 	// Labels are stamped on the container. They are how anything OUTSIDE this
@@ -87,6 +89,8 @@ type ContainerConfig struct {
 	// (PodUIDLabel, from the pod's downward-API UID). Nothing here is required for
 	// a container to be reapable — see ownership.go for why that is not the
 	// caller's job.
+	// The reserved code.internetisalie.net/containers.startup-id key is always
+	// replaced with a private per-start token, without changing the caller's map.
 	Labels map[string]string
 
 	// Ephemeral makes this container safe to run beside another of the same kind:
@@ -181,11 +185,13 @@ func StartContainer(cfg ContainerConfig) (*Resource, error) {
 	return StartContainerContext(context.Background(), cfg)
 }
 
-// StartContainerContext bounds startup by both ctx and cfg.Timeout (including
-// image pull/create). On failure, owned resources are cleaned up with a separate
-// bounded context, even when ctx has been cancelled. The returned resource's
-// lifetime is not tied to ctx once startup succeeds.
-func StartContainerContext(ctx context.Context, cfg ContainerConfig) (*Resource, error) {
+// StartContainerContext uses ctx for Docker operations and cfg.Timeout for the
+// readiness phase only, preserving StartContainer's TCP timeout semantics. Use a
+// caller deadline to bound the whole startup; readiness callbacks must themselves
+// be bounded (ReadyResource must honor its context). Failure cleanup uses a fresh
+// bounded context, including on panic; an original panic is not swallowed. The
+// returned resource's lifetime is not tied to ctx once startup succeeds.
+func StartContainerContext(ctx context.Context, cfg ContainerConfig) (result *Resource, err error) {
 	if err := validateReadiness(cfg); err != nil {
 		return nil, fmt.Errorf("container %s: %w", cfg.Name, err)
 	}
@@ -202,8 +208,6 @@ func StartContainerContext(ctx context.Context, cfg ContainerConfig) (*Resource,
 		cfg.Name = uniqueName(cfg.Name)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
-	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -211,9 +215,29 @@ func StartContainerContext(ctx context.Context, cfg ContainerConfig) (*Resource,
 	if err != nil {
 		return nil, errors.Join(err, ctx.Err())
 	}
+	var r *Resource
+	// Also runs during panic/Goexit. No recover is needed: the original panic
+	// propagates after cleanup. Once registered, use exactly the Purge path so
+	// failed readiness gets the same AutoRemove handling as explicit cleanup.
+	defer func() {
+		if result != nil {
+			return
+		}
+		var cleanupErr error
+		if r != nil {
+			cleanupErr = r.Purge()
+		} else {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
+			defer cancel()
+			cleanupErr = pool.Close(cleanupCtx)
+		}
+		if cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed startup cleanup: %w", cleanupErr))
+		}
+	}()
 	if !cfg.Ephemeral {
 		if errRemove := removeExisting(ctx, pool, cfg.Name); errRemove != nil {
-			return nil, failedStart(pool, errors.Join(errRemove, ctx.Err()))
+			return nil, errors.Join(errRemove, ctx.Err())
 		}
 	}
 
@@ -227,20 +251,22 @@ func StartContainerContext(ctx context.Context, cfg ContainerConfig) (*Resource,
 	cfg.Labels[startupLabel] = uniqueName("start")
 	res, err := runContainer(ctx, pool, cfg)
 	if err != nil {
-		return nil, failedStart(pool, errors.Join(err, ctx.Err(), cleanupUntracked(pool, cfg)))
+		return nil, errors.Join(err, ctx.Err(), cleanupUntracked(pool, cfg, ctx.Err() != nil))
 	}
 
-	r := &Resource{pool: pool, resource: res, port: cfg.Port, name: cfg.Name}
+	r = &Resource{pool: pool, resource: res, port: cfg.Port, name: cfg.Name}
+	readyCtx, cancel := context.WithTimeout(ctx, cfg.Timeout)
+	defer cancel()
 	if cfg.Port == "" {
-		err = waitForResource(ctx, cfg, r)
+		err = waitForResource(readyCtx, cfg, r)
 	} else {
-		err = waitForReady(ctx, pool, cfg, r)
+		err = waitForReady(readyCtx, pool, cfg, r)
 	}
 	if err == nil {
-		err = ctx.Err()
+		err = readyCtx.Err()
 	}
 	if err != nil {
-		return nil, failedStart(pool, errors.Join(err, ctx.Err()))
+		return nil, errors.Join(err, readyCtx.Err())
 	}
 	return r, nil
 }
@@ -268,16 +294,10 @@ func (r *Resource) Purge() error {
 			}
 		}
 	}
-	return errors.Join(err, r.pool.Close(ctx))
-}
-
-func failedStart(pool dockertest.ClosablePool, cause error) error {
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
-	defer cancel()
-	if err := pool.Close(ctx); err != nil {
-		return errors.Join(cause, fmt.Errorf("failed startup cleanup: %w", err))
+	if err := errors.Join(err, r.pool.Close(ctx)); err != nil {
+		return fmt.Errorf("failed to purge container: %w", err)
 	}
-	return cause
+	return nil
 }
 
 func initPool(ctx context.Context, timeout time.Duration) (dockertest.ClosablePool, error) {
@@ -327,9 +347,6 @@ func runContainer(ctx context.Context, pool dockertest.ClosablePool, cfg Contain
 		dockertest.WithContainerConfig(func(cc *container.Config) {
 			if cfg.Entrypoint != nil {
 				cc.Entrypoint = cfg.Entrypoint
-			}
-			if cfg.Port == "" {
-				cc.ExposedPorts = nil
 			}
 		}),
 		dockertest.WithLabels(ownershipLabels(cfg.Labels)),

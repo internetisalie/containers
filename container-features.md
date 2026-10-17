@@ -2,14 +2,16 @@
 
 Status: **implemented and locally verified on 2026-10-16**, on
 `work/loom-workspace-container-harness`, based on `50ebe87` (`v0.5.0`).
+Review follow-up verification on 2026-10-17 is recorded below; it supersedes the
+initial whole-startup interpretation of `Timeout`.
 
 ## Scope
 
 Extend the shared Go library for the existing Loom agent fixture, rather than
 adding another Docker CLI harness. Preserve the existing TCP-service configuration,
 readiness callback, ephemeral identities, ownership labels, limits and mounts.
-Phase 2, consumer migration, forge delivery/release and service deployment are not
-part of this implementation request.
+Phase 2, consumer migration, release and service deployment are not part of this
+library change. The branch was subsequently pushed and PR #4 opened for review.
 
 ## Delivered API and implementation
 
@@ -22,8 +24,10 @@ part of this implementation request.
   `container:<ID>` must work without accidentally publishing ports. Leave ordinary
   service defaults unchanged.
 - Added `StartContainerContext`; the existing `StartContainer` remains a wrapper.
-  Bound startup by configuration timeout and caller cancellation; on failure use
-  a separate bounded cleanup context, preserving cleanup failures in the error.
+  The caller context bounds Docker operations; `Timeout` bounds readiness only,
+  starting after registration, preserving the TCP contract. Callbacks must be
+  bounded (`ReadyResource` must honor its context). On failure use a separate
+  bounded cleanup context, preserving cleanup failures in the error.
 - Added resource `ID`, fresh `Inspect`, `Stop`, `Kill`, `Wait`, `Logs` and `Exec`.
   Address operations by immutable container ID, never by reusable name. Stop
   accepts a nonnegative grace duration; Kill sends SIGKILL; Wait reports the real
@@ -35,7 +39,7 @@ part of this implementation request.
   No dependency-version bump, custom generic Docker client, privileged mode or
   production-service access is needed.
 
-## Verification
+## Initial verification at `e4cfbe1` (2026-10-16)
 
 - Baseline: `go test -p 1 -race ./... -count=1 -timeout=180s` passed on 2026-10-16
   with Go 1.26.6 and Docker 29.1.3. Dependencies stay pinned; `GOWORK=off` and
@@ -56,8 +60,8 @@ part of this implementation request.
   inspection and Go compiler/tests are used instead; no exhaustive semantic
   reference-search claim is made.
 
-Final commands (through `../run-with-worktree-scratch "$PWD"`, sourcing the
-Glimmer environment and setting `GOWORK=off GOTOOLCHAIN=local`):
+Commands (with `GOWORK=off GOTOOLCHAIN=local`; the implementation environment used
+an external disk-backed scratch wrapper and a provisioned Go toolchain):
 
 ```sh
 go test -p 1 -race ./... -count=1 -timeout=180s -v \
@@ -70,9 +74,11 @@ go vet ./...
 go build ./...
 ```
 
-Local logs are `.agent-scratch/final-race.log`, `worker-repeat.log` and
+Implementer-local logs are `.agent-scratch/final-race.log`, `worker-repeat.log` and
 `startup-repeat.log`; the coverage profile is adjacent. Scratch is ignored, not
-part of the library source or release. All targeted disposable worker/relaunch
+part of the repository or release, and these logs are not reviewer-accessible
+artifacts. Reproduce the commands above rather than relying on local log links.
+All targeted disposable worker/relaunch
 containers were absent after verification. The original Glimmer checkout remains
 clean on `main`; no installed service was a test target.
 
@@ -133,13 +139,90 @@ a successful cleanup assertion.
 | Hide failed-start cleanup error | `TestStartupCancellationBeforeResourceRegistration/cleanup-error` |
 | Lose cancellation when daemon response wins | `TestStartupCancellationBeforeResourceRegistration`, 100 targeted iterations |
 
+## Review follow-up (2026-10-17)
+
+[PR #4](https://gitea.internetisalie.net/internetisalie/containers/pulls/4) has a
+self-contained [requirements and acceptance comment](https://gitea.internetisalie.net/internetisalie/containers/pulls/4#issuecomment-33213).
+The independent [request-changes review](https://gitea.internetisalie.net/internetisalie/containers/pulls/4#pullrequestreview-5789)
+reported four medium findings. The implementing session made these corrections;
+independent acceptance of the corrections is still required:
+
+- **M1 — late create after cancellation:** if the initial name inspection finds
+  nothing owned by this attempt, a cancelled startup polls all states using the
+  private per-start label for up to two seconds. Matching results are removed by
+  ID; foreign results are ignored. Listing/removal failures remain errors. This
+  bounds recovery, not daemon-side completion: arbitrarily late create and process
+  death still need an external reaper. The deterministic test releases a delayed
+  create only after initial NotFound and an initial list without the fixture;
+  it verifies a subsequent search removes the created ID, not a foreign result.
+  Non-cancelled failures do not pay that polling delay.
+- **M2 — TCP timeout compatibility:** `Timeout` again covers only readiness, after
+  pull/create/start/registration, for both TCP and worker modes. A caller deadline
+  bounds the whole operation, subject to callbacks honoring their bounds. Tests
+  delay uncached image pull and container creation beyond `Timeout` and require
+  successful startup with a fresh readiness budget in both modes.
+- **M3 — failed-start AutoRemove:** deferred failure cleanup uses `Resource.Purge`
+  once registered, so explicit purge and failed readiness share observed-removal
+  conflict handling. Deterministic and actual-Docker tests exercise the failure
+  path, not just successful-start cleanup.
+- **M4 — readiness panic:** cleanup is deferred immediately after pool creation;
+  it removes the registered resource and closes the client during unwinding,
+  without swallowing/replacing the original panic. Both worker and TCP callbacks
+  are tested. A cleanup error cannot be returned while propagating a panic.
+- Documented daemon-side exec failures in stdout with status 126/127, peer-first
+  teardown hazards (purge workers first), callback bounds, stop-signal behavior at
+  zero grace, the reserved startup label and the intentional Moby inspection type.
+  Restored the purge-error prefix and removed the ineffective `ExposedPorts=nil`
+  assignment. Removed external workspace commands/links from the public README;
+  local evidence locations here are explicitly non-portable, unshipped artifacts.
+
+Final follow-up gate: **45 top-level tests passed with race detection, no skips**,
+92.1% statement coverage. Existing 20 baseline tests and `go.mod`/`go.sum` remain
+unchanged. `go vet ./...`, `go build ./...`, gofumpt and diff checks passed.
+All seven newly added top-level review regression tests passed five consecutive
+race-enabled runs before mutation; the full suite was rerun after restoration.
+The local final log/profile are `review-final-race.log` and
+`review-final-coverage.out` under ignored `.agent-scratch`, not forge CI evidence.
+
+An additional scratch Go harness ran 80 actual-Docker starts with deterministic
+random caller deadlines of 0–400 ms (seed 42), AutoRemove enabled, the same bounded
+NATS image fixture, and an isolated batch label. It observed **43 successful
+starts, 37 cancelled starts, zero remaining batch containers** when listing all
+states after each result/cleanup. The harness and `review-cancel-stress.log` are
+local scratch evidence, not shipped tests. This does not establish absence of
+objects appearing beyond the documented recovery window or on other daemons.
+
+Nine additional compiling mutations were caught and restored (not a rerun of all
+19 original mutations):
+
+| Deliberate regression | Test that caught it |
+| --- | --- |
+| Omit late-create recovery in cleanup logic | `TestCancelledCreateIsFoundAfterInitialNotFound` |
+| Do not repeat the initial label search | `TestCancelledCreateIsFoundAfterInitialNotFound` |
+| Trust a foreign result's ID without checking its label | `TestCancelledCreateIsFoundAfterInitialNotFound` |
+| Poll certain, non-cancelled failures | `TestUncancelledCreateFailureDoesNotPollOrRemoveForeign` |
+| Hide a late-create lookup failure | `TestLateCreateLookupFailureIsReported` |
+| Disable cancellation recovery at the startup call site | `TestCancelledCreateIsFoundAfterInitialNotFound` |
+| Consume readiness timeout during pull/create | `TestReadinessTimeoutDoesNotIncludePullOrCreate`, TCP and worker, pull and create |
+| Use pool-close directly for registered failure cleanup | `TestFailedReadinessWaitsForAutoRemoval` |
+| Skip deferred cleanup on panic | `TestReadinessPanicCleansUpAndPropagates`, worker and TCP |
+
+Reproduce the follow-up gate with the same full-race/build/vet commands above.
+The seven review regressions can be repeated with:
+
+```sh
+go test -p 1 -race ./... \
+  -run '^TestCancelledCreate|^TestUncancelledCreate|^TestLateCreate|^TestReadinessTimeout|^TestFailedReadiness|^TestReadinessPanic|^TestWorkerAutoRemoveFailed' \
+  -count=5 -timeout=90s
+```
+
 ## Delivery boundaries
 
-Implementation and verification were performed in the implementing session; no
-independent review approval is claimed. `go.mod` and `go.sum` are unchanged. No
-remote push, PR, merge, tag, release, consumer dependency change or deployment has
-been performed. The README documents the public API and its cancellation,
-buffering, cleanup and concurrency limits.
+Implementation and local verification were performed in the implementing session;
+the independent review requested changes, and no approval is claimed. `go.mod` and
+`go.sum` are unchanged. The branch is pushed for PR review; no merge, tag, release,
+consumer dependency change or deployment has been performed. The README documents
+the public API and its cancellation, buffering, cleanup and concurrency limits.
 
 Loom's actual-agent binary/image scenarios were not rerun with this version:
 Delivery still uses its existing dependency and Docker CLI helper. Library
@@ -147,5 +230,5 @@ readiness is not consumer adoption or permission to start Phase 2. Release and
 consumer adoption must follow the project's PR/CI/review/main/tag policy; no tag
 should be cut from this feature branch.
 
-Related sequencing/consumer acceptance:
-`../loom-proxy-observation-api-scope.md`, “Container-library prerequisite”.
+The linked PR requirements comment reproduces the relevant cross-project scope
+and later consumer acceptance, without requiring access to local workspace docs.
